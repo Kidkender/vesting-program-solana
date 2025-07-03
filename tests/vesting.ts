@@ -218,6 +218,15 @@ describe("vesting", () => {
         }
     })
 
+    it("Team B cannot claim before 2 years", async () => {
+        try {
+            await claimCommon(teamB.publicKey, mintAddress, teamBATA, teamB );
+            assert.fail("Team B should not be able to claim");
+        } catch (err) {
+            assert.equal(err.error?.errorCode?.code, "CliffNotReached");
+        }
+    }) 
+
 
     async function claimCommon(sender: PublicKey, token: PublicKey, tokenAccout: PublicKey, signer: Keypair ): Promise<void> {
         await program.methods.claim(dataBump,escrowBump).accounts({
