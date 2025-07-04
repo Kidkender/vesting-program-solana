@@ -4,6 +4,11 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
+pub const SECONDS_PER_MONTH: i64 = 2_629_776; // Average seconds in a month (30.44 days)
+pub const GRACE_PERIOD: i64 = 3 * SECONDS_PER_MONTH; // 3 months grace period
+pub const MAX_START_DELAY: i64 = 365 * 24 * 60 * 60; // Maximum delay for start time (1 year in seconds)
+
+
 declare_id!("2Ut9RKeaqo895gVTEZ6fgG9WJ2sZAPfws5Hp3WGkcAg8");
 
 #[program]
@@ -29,7 +34,6 @@ pub mod vesting {
         if data_account.authority == Pubkey::default() {
             data_account.authority = ctx.accounts.sender.to_account_info().key();
         } else {
-
             require!(
                 data_account.authority == ctx.accounts.sender.key(),
                 VestingError::UnauthorizedAdmin
@@ -44,6 +48,8 @@ pub mod vesting {
         let mut seen = std::collections::HashSet::new();
 
         for b in beneficiaries.iter() {
+            require!(b.total_months >= 1, VestingError::InvalidVestingPeriod);
+            require!(b.cliff_months <= 48, VestingError::CliffTooLong);
             require!(b.cliff_months < b.total_months, VestingError::InvalidCliffPeriod);
             require!(b.allocated_tokens > 0, VestingError::InvalidAllocation);
             require!(b.start_time >= now, VestingError::InvalidStartTime);
@@ -74,10 +80,9 @@ pub mod vesting {
             authority: ctx.accounts.sender.to_account_info(),
         };
 
-        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), transfer_instruction);
-        let multiplier = 10u128.pow(decimals as u32);
-        let raw_amount = (data_account.token_amount as u128).checked_mul(multiplier).ok_or(VestingError::MathOverflow)?;
-        let transfer_amount = u64::try_from(raw_amount).map_err(|_| VestingError::MathOverflow)?;       
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), transfer_instruction);   
+
+        let transfer_amount = data_account.token_amount;
 
         token::transfer(cpi_ctx, transfer_amount)?;
 
@@ -95,14 +100,24 @@ pub mod vesting {
     /// - Calculates elapsed months and checks cliff.
     /// - Computes claimable tokens and transfers from escrow to beneficiary.
     /// - Updates claimed token amount.
-    pub fn claim(ctx: Context<Claim>, data_bump: u8, _escrow_bump: u8) -> Result<()> {
+    pub fn claim(ctx: Context<Claim>, data_bump: u8, escrow_bump: u8) -> Result<()> {
         let sender = &ctx.accounts.sender;
         let escrow_wallet = &ctx.accounts.escrow_wallet;
         let data_account = &mut ctx.accounts.data_account;
         let token_program = &ctx.accounts.token_program;
         let token_mint_key = &ctx.accounts.token_mint.key();
         let beneficiaries_ata = &ctx.accounts.wallet_to_deposit_to;
-        let decimals = data_account.decimals;
+
+        let (expected_escrow_pda, expected_escrow_bump) = Pubkey::find_program_address(
+            &[b"escrow_wallet".as_ref(), token_mint_key.as_ref()],
+            ctx.program_id
+        );
+
+        require!(ctx.accounts.escrow_wallet.key() == expected_escrow_pda,
+            VestingError::InvalidEscrowWallet
+        );
+
+        require!(escrow_bump == expected_escrow_bump,         VestingError::InvalidEscrowBump);
 
         let index = data_account
             .beneficiaries
@@ -113,8 +128,6 @@ pub mod vesting {
         let beneficiary = data_account.beneficiaries[index];
 
         let now = Clock::get()?.unix_timestamp;
-
-        const SECONDS_PER_MONTH: i64 = 2_628_000; // Average seconds 30.4 days per month
 
         let cliff_months = beneficiary.cliff_months as u64;
         let total_months = beneficiary.total_months as u64;                                     
@@ -135,16 +148,12 @@ pub mod vesting {
 
         let months_vested = std::cmp::min(months_elapsed - cliff_months, vesting_month);
 
-        let multiplier = 10u128.pow(decimals as u32);
-        let allocated_raw = (beneficiary.allocated_tokens as u128)
-            .checked_mul(multiplier)
-            .ok_or(VestingError::MathOverflow)?;
-
-        let claimed_raw = (beneficiary.claimed_tokens as u128)
-            .checked_mul(multiplier)
-            .ok_or(VestingError::MathOverflow)?;
-
-        let unlocked = if months_vested == vesting_month {
+        let allocated_raw = beneficiary.allocated_tokens as u128;
+          
+        let claimed_raw =  beneficiary.claimed_tokens as u128;
+        
+        require!( (allocated_raw * months_vested as u128) % vesting_month as u128 == 0, VestingError::PrecisionLoss );
+        let unlocked = if months_vested >= vesting_month {
             allocated_raw
         } else {
             (allocated_raw * months_vested as u128) / vesting_month as u128
@@ -172,9 +181,9 @@ pub mod vesting {
         let transfer_amount = u64::try_from(claimable).map_err(|_| VestingError::MathOverflow)?;
 
         require!(escrow_wallet.amount >= transfer_amount, VestingError::InsufficientBalance);
+        data_account.beneficiaries[index].claimed_tokens += transfer_amount ;
         token::transfer(cpi_ctx, transfer_amount)?;
 
-        data_account.beneficiaries[index].claimed_tokens += transfer_amount ;
 
         emit!(TokensClaimed {
             beneficiary: sender.key(),
@@ -192,17 +201,30 @@ pub mod vesting {
     pub fn withdraw(
         ctx: Context<WithdrawUnclaimed>,
         data_bump: u8,
-        _escrow_bump: u8,
+        escrow_bump: u8,
     ) -> Result<()> {
         let data_account = &mut ctx.accounts.data_account;
         let escrow_wallet = &ctx.accounts.escrow_wallet;
         let admin_wallet = &ctx.accounts.admin_wallet;
+        let token_mint_key = &ctx.accounts.token_mint.key();
 
+        let (expected_escrow_pda, expected_escrow_bump) = Pubkey::find_program_address(
+            &[b"escrow_wallet".as_ref(), token_mint_key.as_ref()],
+            ctx.program_id
+        );
+        
+        require!(
+            ctx.accounts.escrow_wallet.key() == expected_escrow_pda,
+            VestingError::InvalidEscrowWallet
+        );
+        
+        require!(
+            escrow_bump == expected_escrow_bump,
+            VestingError::InvalidEscrowBump
+        );
 
         require!(data_account.authority == ctx.accounts.admin.key(), VestingError::UnauthorizedAdmin);
         let now = Clock::get()?.unix_timestamp;
-        const SECONDS_PER_MONTH: i64 = 2_628_000;
-        const GRACE_PERIOD: i64 = 3 * SECONDS_PER_MONTH; // 3 months grace period
 
         let mut total_unclaimed = 0u64;
         let mut _beneficiaries_processed = 0u32;
@@ -210,10 +232,14 @@ pub mod vesting {
         for i in 0..data_account.beneficiaries.len() {
             let beneficiary = &data_account.beneficiaries[i];
 
-            let total_vesting_period = beneficiary.start_time + 
-                (beneficiary.total_months as i64 * SECONDS_PER_MONTH);
+            // Calculate when beneficiary can actually start claiming (after cliff)
+            let cliff_end_time = beneficiary.start_time + (beneficiary.cliff_months as i64 * SECONDS_PER_MONTH);
+            // Calculate when full vesting period ends
+            let total_vesting_period = beneficiary.start_time + (beneficiary.total_months as i64 * SECONDS_PER_MONTH);
 
-            if now > total_vesting_period + GRACE_PERIOD {
+            let earliest_withdraw_time = std::cmp::max(cliff_end_time + GRACE_PERIOD, total_vesting_period + GRACE_PERIOD);
+
+            if now > earliest_withdraw_time {
                 let unclaimed_tokens = beneficiary.allocated_tokens
                     .saturating_sub(beneficiary.claimed_tokens);
 
@@ -226,15 +252,9 @@ pub mod vesting {
         }
 
         require!(total_unclaimed > 0, VestingError::NoUnclaimedTokens);
-        let multiplier = 10u128.pow(data_account.decimals as u32);
-        let unclaimed_raw = (total_unclaimed as u128)
-            .checked_mul(multiplier)
-            .ok_or(VestingError::MathOverflow)?;
-        let unclaimed_amount = u64::try_from(unclaimed_raw)
-            .map_err(|_| VestingError::MathOverflow)?;
-
+        
         require!(
-            escrow_wallet.amount >= unclaimed_amount,
+            escrow_wallet.amount >= total_unclaimed,
             VestingError::InsufficientBalance
         );
         let token_mint_key = &ctx.accounts.token_mint.key();
@@ -253,7 +273,7 @@ pub mod vesting {
             signer_seeds
         );
 
-        token::transfer(cpi_ctx, unclaimed_amount)?;
+        token::transfer(cpi_ctx, total_unclaimed)?;
         emit!(AllUnclaimedWithdrawn {
            admin: ctx.accounts.admin.key(),
            total_amount: total_unclaimed,
@@ -310,7 +330,6 @@ pub struct Initialize<'info> {
     pub system_program: Program<'info, System>,
 
     pub token_program: Program<'info, Token>
-
 }
 
 
@@ -324,7 +343,8 @@ pub struct Claim<'info> {
     )]
     pub data_account: Account<'info, DataAccount>,
 
-    #[account(mut,
+    #[account(
+        mut,
         seeds= [b"escrow_wallet".as_ref(), token_mint.key().as_ref()],
         bump=wallet_bump,
     )]
@@ -455,6 +475,10 @@ pub enum VestingError {
     TooManyBeneficiaries,
     #[msg("Invalid vesting configuration: total_months not divisible by cliff_months")]
     InvalidVestingConfig,
+    #[msg("Invalid vesting period: total_months must be at least 1")]
+    InvalidVestingPeriod,
+    #[msg("Cliff period is too long (max 48 months)")]
+    CliffTooLong,
     #[msg("Math overflow")]
     MathOverflow,
     #[msg("No beneficiaries provided")]
@@ -483,4 +507,10 @@ pub enum VestingError {
     InvalidTokenMint,
     #[msg("Start time is too far in the future")]
     StartTimeTooFar,
+    #[msg("Invalid escrow wallet PDA")]
+    InvalidEscrowWallet,
+    #[msg("Invalid escrow bump seed")]
+    InvalidEscrowBump,
+    #[msg("Precision loss occurred")]
+    PrecisionLoss,
 }
