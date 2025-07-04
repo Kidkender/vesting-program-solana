@@ -30,7 +30,6 @@ pub mod vesting {
         let data_account = &mut ctx.accounts.data_account;
         let now = Clock::get()?.unix_timestamp;
         
-        const MAX_START_DELAY: i64 = 365 * 24 * 60 * 60;
         if data_account.authority == Pubkey::default() {
             data_account.authority = ctx.accounts.sender.to_account_info().key();
         } else {
