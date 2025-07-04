@@ -41,10 +41,10 @@ pub mod vesting {
         }
 
         require!(!beneficiaries.is_empty(), VestingError::NoBeneficiaries);
+        require!(beneficiaries.len() <= 50, VestingError::TooManyBeneficiaries);
         require!(amount > 0, VestingError::InvalidAmount);
         require!(decimals <= 9, VestingError::InvalidDecimals);
 
-        require!(beneficiaries.len() <= 50, VestingError::TooManyBeneficiaries);
         let mut seen = std::collections::HashSet::new();
 
         for b in beneficiaries.iter() {
@@ -281,11 +281,16 @@ pub mod vesting {
            timestamp: now,
     });
 
-
-
         Ok(())
     }
 
+}
+
+// Macro to calculate the space required for the DataAccount based on the number of beneficiaries.
+macro_rules! calculate_vesting_space {
+    ($beneficiaries_count: expr) => {
+        8 + 8 + 32 + 32 + 32 + 1 + (4 + $beneficiaries_count * (32 + 8 + 8 + 8 + 1 + 1) + 1)
+    };
 }
 
 /// Accounts required for the `initialize` instruction.
@@ -296,11 +301,11 @@ pub mod vesting {
 /// - token_mint: The SPL token mint.
 /// - system_program, token_program: System and token programs.
 #[derive(Accounts)]
+#[instruction(beneficiaries: Vec<Beneficiary>, amount: u64, decimals: u8)]
 pub struct Initialize<'info> {
-
     #[account(init,
         payer = sender,
-        space =  8 + 8 + 32 + 32 + 32 + 1 + (4 + 50 * (32 + 8 + 8 + 8 + 1 + 1) + 1),
+        space = calculate_vesting_space!(beneficiaries.len()),
         seeds = [b"data_account", token_mint.key().as_ref()],
         bump
     )]
@@ -503,8 +508,6 @@ pub enum VestingError {
     UnauthorizedAdmin,
     #[msg("No unclaimed tokens available")]
     NoUnclaimedTokens,
-    #[msg("Invalid token mint")]
-    InvalidTokenMint,
     #[msg("Start time is too far in the future")]
     StartTimeTooFar,
     #[msg("Invalid escrow wallet PDA")]
