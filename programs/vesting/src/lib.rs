@@ -5,7 +5,7 @@ use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 pub const SECONDS_PER_MONTH: i64 = 2_629_776; // Average seconds in a month (30.44 days)
-pub const GRACE_PERIOD: i64 = 3 * SECONDS_PER_MONTH; // 3 months grace period
+pub const GRACE_PERIOD: i64 = 6 * SECONDS_PER_MONTH; // 6 months grace period
 pub const MAX_START_DELAY: i64 = 365 * 24 * 60 * 60; // Maximum delay for start time (1 year in seconds)
 
 
@@ -56,15 +56,22 @@ pub mod vesting {
                 b.start_time <= now + MAX_START_DELAY,
                 VestingError::StartTimeTooFar
             );
+
             if b.cliff_months > 0 {
+                // Only allow vesting with total time divisible by cliff time
                 require!(b.total_months % b.cliff_months == 0, VestingError::InvalidVestingConfig);
             }
+            
             require!(seen.insert(b.key), VestingError::DuplicateBeneficiary);            
         }
 
-        let total_allocated: u64 = beneficiaries.iter()
-            .map(|b| b.allocated_tokens)
-            .sum();
+        let mut total_allocated = 0u64;
+
+        for b in beneficiaries.iter() {
+            total_allocated = total_allocated
+                .checked_add(b.allocated_tokens)
+                .ok_or(VestingError::MathOverflow)?;
+        }
 
         data_account.beneficiaries = beneficiaries;
         data_account.token_amount = amount;
@@ -82,6 +89,8 @@ pub mod vesting {
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), transfer_instruction);   
 
         let transfer_amount = data_account.token_amount;
+
+        require!(ctx.accounts.wallet_to_withdraw_from.amount >= transfer_amount, VestingError::InsufficientBalance);
 
         token::transfer(cpi_ctx, transfer_amount)?;
 
@@ -133,13 +142,17 @@ pub mod vesting {
         let vesting_month = total_months - cliff_months;
 
         require!(vesting_month > 0, VestingError::InvalidVestingConfig);
-        let mut months_elapsed = 0;
-        let mut t = beneficiary.start_time;
-
-        while now >= t + SECONDS_PER_MONTH {
-            months_elapsed += 1;
-            t += SECONDS_PER_MONTH;
-        }
+ 
+        let months_elapsed = if now >= beneficiary.start_time {
+            let time_diff = now.saturating_sub(beneficiary.start_time);
+            let calculated_months = time_diff.checked_div(SECONDS_PER_MONTH).ok_or(VestingError::MathOverflow)?;
+            
+            // Safety cap: use actual beneficiary's total_months + small buffer
+            let safety_cap = (beneficiary.total_months as i64).saturating_add(120);
+            std::cmp::min(calculated_months, safety_cap) as u64
+        } else {
+            0u64
+        };
 
         if months_elapsed < cliff_months {
             return err!(VestingError::CliffNotReached);
@@ -150,12 +163,15 @@ pub mod vesting {
         let allocated_raw = beneficiary.allocated_tokens as u128;
           
         let claimed_raw =  beneficiary.claimed_tokens as u128;
-        
-        require!( (allocated_raw * months_vested as u128) % vesting_month as u128 == 0, VestingError::PrecisionLoss );
+                
         let unlocked = if months_vested >= vesting_month {
             allocated_raw
         } else {
-            (allocated_raw * months_vested as u128) / vesting_month as u128
+            allocated_raw
+                .checked_mul(months_vested as u128)
+                .ok_or(VestingError::MathOverflow)?
+                .checked_div(vesting_month as u128)
+                .ok_or(VestingError::MathOverflow)?
         };
 
         let claimable = unlocked.saturating_sub(claimed_raw );
@@ -180,9 +196,10 @@ pub mod vesting {
         let transfer_amount = u64::try_from(claimable).map_err(|_| VestingError::MathOverflow)?;
 
         require!(escrow_wallet.amount >= transfer_amount, VestingError::InsufficientBalance);
+        
         data_account.beneficiaries[index].claimed_tokens += transfer_amount ;
+        
         token::transfer(cpi_ctx, transfer_amount)?;
-
 
         emit!(TokensClaimed {
             beneficiary: sender.key(),

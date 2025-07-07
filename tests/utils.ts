@@ -1,5 +1,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import * as spl from "@solana/spl-token";
+import { u64 } from "@solana/buffer-layout-utils";
+
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountInstruction,
@@ -10,12 +12,16 @@ import {
   Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
+  SystemProgram,
   Transaction,
 } from "@solana/web3.js";
-import { BN } from "bn.js";
+import { BankrunProvider } from "anchor-bankrun";
+import { BanksClient, Clock, ProgramTestContext } from "solana-bankrun";
+import { BN } from "@coral-xyz/anchor";
+import { SECOND_PER_MONTH } from "./constant";
 
 export const createMint = async (
-  provider: anchor.AnchorProvider,
+  provider: BankrunProvider,
   decimals: number
 ): Promise<PublicKey> => {
   const tokenMint = new anchor.web3.Keypair();
@@ -51,22 +57,26 @@ export const createMint = async (
   return tokenMint.publicKey;
 };
 
+function fakeAirdrop(
+  ctx: ProgramTestContext,
+  pubkey: PublicKey,
+  lamports: number
+) {
+  ctx.setAccount(pubkey, {
+    lamports,
+    owner: SystemProgram.programId,
+    executable: false,
+    data: Buffer.alloc(0),
+  });
+}
 export const createUserAndATA = async (
-  provider: anchor.AnchorProvider,
+  ctx: ProgramTestContext,
+  provider: BankrunProvider,
   mint: PublicKey
 ): Promise<[Keypair, PublicKey]> => {
   const user = Keypair.generate();
-  let token_airdrop = await provider.connection.requestAirdrop(
-    user.publicKey,
-    10 * LAMPORTS_PER_SOL
-  );
-  const latestBlockHash = await provider.connection.getLatestBlockhash();
 
-  await provider.connection.confirmTransaction({
-    blockhash: latestBlockHash.blockhash,
-    lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
-    signature: token_airdrop,
-  });
+  fakeAirdrop(ctx, user.publicKey, 10 * LAMPORTS_PER_SOL);
 
   let userATA = await spl.getAssociatedTokenAddress(
     mint,
@@ -92,10 +102,9 @@ export const createUserAndATA = async (
 };
 
 export const createAndFundSenderATA = async (
-  provider: anchor.AnchorProvider,
+  provider: BankrunProvider,
   mint: anchor.web3.PublicKey,
-  totalAmount: number, // in raw tokens (not decimals applied yet)
-  decimals: number
+  rawAmount: bigint
 ): Promise<anchor.web3.PublicKey> => {
   const senderPubkey = provider.wallet.publicKey;
 
@@ -125,7 +134,7 @@ export const createAndFundSenderATA = async (
       mint,
       senderATA,
       senderPubkey,
-      totalAmount * 10 ** decimals,
+      rawAmount,
       [],
       TOKEN_PROGRAM_ID
     )
@@ -135,44 +144,52 @@ export const createAndFundSenderATA = async (
   return senderATA;
 };
 
-export const fundATA = async (
-  provider: anchor.AnchorProvider,
-  mint: PublicKey,
-  user: Keypair,
-  userATA: PublicKey,
-  decimals: number
-): Promise<PublicKey> => {
-  const tx = new Transaction().add(
-    spl.createMintToInstruction(
-      mint,
-      userATA,
-      provider.wallet.publicKey,
-      15_000_000_000 * 10 ** decimals
-    )
-  );
-
-  await provider.sendAndConfirm(tx, [user]);
-  console.log("userata finding successful: ");
-  return userATA;
-};
-
 export const getTokenBalance = async (
   tokenAccount: PublicKey,
-  provider: anchor.AnchorProvider
-) => {
-  const account = await provider.connection
-    .getTokenAccountBalance(tokenAccount)
+  provider: BankrunProvider
+): Promise<anchor.BN> => {
+  const accountInfo = await provider.connection
+    .getAccountInfo(tokenAccount)
     .catch(() => null);
-  if (!account) {
+
+  if (!accountInfo) {
     console.log("Token account not found:", tokenAccount.toBase58());
-    return 0;
+    return new BN(0);
   }
-  return new BN(account.value.uiAmount);
+
+  const data = spl.AccountLayout.decode(accountInfo.data);
+  const amountOrigin = data.amount;
+
+  const amount = u64(amountOrigin.toString());
+
+  return new BN(amount.property);
 };
+
+export function toRawUnit(amount: number, decimals: number = 6): BN {
+  const [whole, frac = ""] = amount.toString().split(".");
+  const fracPart = frac.padEnd(decimals, "0").slice(0, decimals);
+  const raw = whole + fracPart;
+
+  const result = new BN(raw);
+  // console.log(`toRawUnit(${amount}) = ${result.toString()}`);
+  return result;
+}
 
 export async function createPDA(
   seeds: Buffer[],
   programId: PublicKey
 ): Promise<[PublicKey, number]> {
   return PublicKey.findProgramAddressSync(seeds, programId);
+}
+
+export function getPassedMonths(
+  startTime: number,
+  currentTime: number,
+  bufferSeconds: number = 0
+): number {
+  const passedSeconds = currentTime + bufferSeconds - startTime;
+
+  if (passedSeconds < 0) return 0;
+
+  return Math.floor(passedSeconds / Number(SECOND_PER_MONTH));
 }
