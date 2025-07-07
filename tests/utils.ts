@@ -185,9 +185,14 @@ export async function createPDA(
 export function getPassedMonths(
   startTime: number,
   currentTime: number,
+  cliffMonths: number,
   bufferSeconds: number = 0
 ): number {
-  const passedSeconds = currentTime + bufferSeconds - startTime;
+  const passedSeconds =
+    currentTime +
+    bufferSeconds -
+    startTime -
+    cliffMonths * Number(SECOND_PER_MONTH); // (now + bufferSecond) - startTime - (cliffMonth * SECOND_PER_MONTH)
 
   if (passedSeconds < 0) return 0;
 
