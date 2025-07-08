@@ -1,30 +1,65 @@
+// ================================================================================================
+// SOLANA TOKEN VESTING PROGRAM
+// ================================================================================================
+// A secure, multi-beneficiary token vesting program with cliff periods and grace period recovery.
+//
+// Features:
+// - Multi-beneficiary vesting with individual cliff periods
+// - Admin recovery of unclaimed tokens after grace period
+// - Precision-safe calculations using 128-bit arithmetic
+// - Comprehensive input validation and overflow protection
+//
+// Security Considerations:
+// - Uses Program Derived Addresses (PDAs) for escrow security
+// - Implements checks-effects-interactions pattern
+// - Validates all time-based calculations with safety caps
+// ================================================================================================
+
 #![allow(unexpected_cfgs)]
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-pub const SECONDS_PER_MONTH: i64 = 2_629_776; // Average seconds in a month (30.44 days)
-pub const GRACE_PERIOD: i64 = 6 * SECONDS_PER_MONTH; // 6 months grace period
-pub const MAX_START_DELAY: i64 = 365 * 24 * 60 * 60; // Maximum delay for start time (1 year in seconds)
+// ================================================================================================
+// CONSTANTS
+// ================================================================================================
 
+/// Average seconds in a month (30.44 days) for vesting calculations
+pub const SECONDS_PER_MONTH: i64 = 2_629_776;
+/// Grace period after vesting completion before admin can withdraw unclaimed tokens
+pub const GRACE_PERIOD: i64 = 6 * SECONDS_PER_MONTH;
+/// Maximum allowed delay for vesting start time (prevents far-future exploits)
+pub const MAX_START_DELAY: i64 = 365 * 24 * 60 * 60; 
+/// Maximum number of beneficiaries per vesting schedule (prevents DoS)
+pub const MAX_BENEFICIARIES: usize = 50;
+/// Maximum token decimals supported
+pub const MAX_DECIMALS: u8 = 9;
 
 declare_id!("2Ut9RKeaqo895gVTEZ6fgG9WJ2sZAPfws5Hp3WGkcAg8");
 
+// ================================================================================================
+// PROGRAM INSTRUCTIONS
+// ================================================================================================
 #[program]
 pub mod vesting {
 
     use super::*;
 
-    /// Initializes a vesting schedule for multiple beneficiaries.
-    /// - Only the admin (sender) can initialize or update.
-    /// - Validates input: beneficiaries, total tokens, start time, etc.
-    /// - Transfers tokens from admin's wallet to the escrow wallet.
-    /// - Stores vesting info in DataAccount.
+ /// Initializes a new vesting schedule for multiple beneficiaries.
+    /// 
+    /// This function sets up a token vesting contract with multiple beneficiaries,
+    /// each having their own cliff period and vesting duration. The admin transfers
+    /// tokens to an escrow account controlled by the program.
+    /// 
+    /// # Arguments
+    /// * `beneficiaries` - Vector of beneficiary configurations (max 50)
+    /// * `amount` - Total tokens to vest in RAW UNITS (e.g., 1000 tokens with 9 decimals = 1_000_000_000_000)
+    /// * `decimals` - Token decimals for reference (all calculations use raw units)
     pub fn initialize(
         ctx: Context<Initialize>, 
         beneficiaries: Vec<Beneficiary>, 
-        amount: u64, 
+        amount: u64, // RAW UNITS: Total tokens in smallest denomination
         decimals: u8,
     ) -> Result<()> {
         let data_account = &mut ctx.accounts.data_account;
@@ -40,46 +75,53 @@ pub mod vesting {
         }
 
         require!(!beneficiaries.is_empty(), VestingError::NoBeneficiaries);
-        require!(beneficiaries.len() <= 50, VestingError::TooManyBeneficiaries);
+        require!(beneficiaries.len() <= MAX_BENEFICIARIES, VestingError::TooManyBeneficiaries);
         require!(amount > 0, VestingError::InvalidAmount);
-        require!(decimals <= 9, VestingError::InvalidDecimals);
+        require!(decimals <= MAX_DECIMALS, VestingError::InvalidDecimals);
 
         let mut seen = std::collections::HashSet::new();
 
         for b in beneficiaries.iter() {
+            // Validate vesting periods
             require!(b.total_months >= 1, VestingError::InvalidVestingPeriod);
             require!(b.cliff_months <= 48, VestingError::CliffTooLong);
             require!(b.cliff_months < b.total_months, VestingError::InvalidCliffPeriod);
+            
             require!(b.allocated_tokens > 0, VestingError::InvalidAllocation);
+            
+            // Validate time bounds
             require!(b.start_time >= now, VestingError::InvalidStartTime);
             require!(
                 b.start_time <= now + MAX_START_DELAY,
                 VestingError::StartTimeTooFar
             );
 
+             // Validate vesting configuration consistency
             if b.cliff_months > 0 {
-                // Only allow vesting with total time divisible by cliff time
                 require!(b.total_months % b.cliff_months == 0, VestingError::InvalidVestingConfig);
             }
             
+            // Prevent duplicate beneficiaries
             require!(seen.insert(b.key), VestingError::DuplicateBeneficiary);            
         }
 
+        // Validate total allocation against available amount (all in raw units)
         let mut total_allocated = 0u64;
-
         for b in beneficiaries.iter() {
             total_allocated = total_allocated
                 .checked_add(b.allocated_tokens)
                 .ok_or(VestingError::MathOverflow)?;
         }
+        require!(total_allocated <= amount, VestingError::OverAllocation);
 
+        // Store vesting configuration
         data_account.beneficiaries = beneficiaries;
         data_account.token_amount = amount;
         data_account.decimals = decimals;
         data_account.escrow_wallet = ctx.accounts.escrow_wallet.to_account_info().key();
         data_account.token_mint = ctx.accounts.token_mint.to_account_info().key();
-        require!(total_allocated <= amount, VestingError::OverAllocation);
 
+        // Transfer tokens to escrow 
         let transfer_instruction = Transfer{ 
             from: ctx.accounts.wallet_to_withdraw_from.to_account_info(),
             to: ctx.accounts.escrow_wallet.to_account_info(),
@@ -88,12 +130,11 @@ pub mod vesting {
 
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), transfer_instruction);   
 
-        let transfer_amount = data_account.token_amount;
+        require!(ctx.accounts.wallet_to_withdraw_from.amount >= amount, VestingError::InsufficientBalance);
 
-        require!(ctx.accounts.wallet_to_withdraw_from.amount >= transfer_amount, VestingError::InsufficientBalance);
+        token::transfer(cpi_ctx, amount)?;
 
-        token::transfer(cpi_ctx, transfer_amount)?;
-
+        // Emit initialization event
         emit!(VestingInitialized {
             admin: ctx.accounts.sender.key(),
             token_mint: ctx.accounts.token_mint.key(),
@@ -104,29 +145,42 @@ pub mod vesting {
         Ok(())
     }
 
-    /// Allows a beneficiary to claim their unlocked tokens according to the vesting schedule.
-    /// - Calculates elapsed months and checks cliff.
-    /// - Computes claimable tokens and transfers from escrow to beneficiary.
-    /// - Updates claimed token amount.
+/// Claims unlocked tokens for a beneficiary according to their vesting schedule.
+    /// 
+    /// This function calculates the amount of tokens that have vested for the calling
+    /// beneficiary and transfers the claimable amount to their wallet. The calculation
+    /// considers cliff periods and linear vesting over the specified duration.
+    /// 
+    /// # Arguments
+    /// * `data_bump` - Bump seed for data account PDA validation
+    /// * `escrow_bump` - Bump seed for escrow wallet PDA validation
+    /// 
+    /// # Vesting Logic
+    /// 1. Check if cliff period has passed
+    /// 2. Calculate months elapsed since start time
+    /// 3. Compute linear vesting: (months_vested / total_vesting_months) * allocated_tokens
+    /// 4. Subtract already claimed tokens to get claimable amount
     pub fn claim(ctx: Context<Claim>, data_bump: u8, escrow_bump: u8) -> Result<()> {
         let sender = &ctx.accounts.sender;
         let escrow_wallet = &ctx.accounts.escrow_wallet;
         let data_account = &mut ctx.accounts.data_account;
-        let token_program = &ctx.accounts.token_program;
         let token_mint_key = &ctx.accounts.token_mint.key();
+
+        let token_program = &ctx.accounts.token_program;
         let beneficiaries_ata = &ctx.accounts.wallet_to_deposit_to;
 
+        // Validate escrow wallet PDA
         let (expected_escrow_pda, expected_escrow_bump) = Pubkey::find_program_address(
             &[b"escrow_wallet".as_ref(), token_mint_key.as_ref()],
             ctx.program_id
         );
-
         require!(ctx.accounts.escrow_wallet.key() == expected_escrow_pda,
             VestingError::InvalidEscrowWallet
         );
+        require!(escrow_bump == expected_escrow_bump,
+            VestingError::InvalidEscrowBump);
 
-        require!(escrow_bump == expected_escrow_bump,         VestingError::InvalidEscrowBump);
-
+        // Find beneficiary in the list
         let index = data_account
             .beneficiaries
             .iter()
@@ -134,35 +188,37 @@ pub mod vesting {
             .ok_or(VestingError::BeneficiaryNotFound)?;
 
         let beneficiary = data_account.beneficiaries[index];
-
         let now = Clock::get()?.unix_timestamp;
 
+        // Calculate vesting periods
         let cliff_months = beneficiary.cliff_months as u64;
         let total_months = beneficiary.total_months as u64;                                     
         let vesting_month = total_months - cliff_months;
 
         require!(vesting_month > 0, VestingError::InvalidVestingConfig);
  
+         // Calculate elapsed time with safety cap
         let months_elapsed = if now >= beneficiary.start_time {
             let time_diff = now.saturating_sub(beneficiary.start_time);
             let calculated_months = time_diff.checked_div(SECONDS_PER_MONTH).ok_or(VestingError::MathOverflow)?;
             
             // Safety cap: use actual beneficiary's total_months + small buffer
-            let safety_cap = (beneficiary.total_months as i64).saturating_add(120);
+            let safety_cap = (beneficiary.total_months as i64).saturating_add(120); 
             std::cmp::min(calculated_months, safety_cap) as u64
         } else {
             0u64
         };
 
+        // Check if cliff period has passed
         if months_elapsed < cliff_months {
             return err!(VestingError::CliffNotReached);
         }
 
         let months_vested = std::cmp::min(months_elapsed - cliff_months, vesting_month);
 
-        let allocated_raw = beneficiary.allocated_tokens as u128;
-          
-        let claimed_raw =  beneficiary.claimed_tokens as u128;
+        // Calculate unlocked tokens using 128-bit arithmetic for precision
+        let allocated_raw = beneficiary.allocated_tokens as u128; // RAW UNITS
+        let claimed_raw = beneficiary.claimed_tokens as u128;     // RAW UNITS
                 
         let unlocked = if months_vested >= vesting_month {
             allocated_raw
@@ -210,10 +266,24 @@ pub mod vesting {
         Ok(())
     }
 
-    /// Allows the admin to withdraw unclaimed tokens after the vesting period plus a grace period (3 months).
-    /// - Sums up all unclaimed tokens for expired beneficiaries.
-    /// - Transfers these tokens back to the admin's wallet.
-    /// - Updates beneficiary state.
+    /// Withdraws unclaimed tokens back to admin after vesting period plus grace period.
+    /// 
+    /// This function allows the admin to recover tokens that remain unclaimed after
+    /// the vesting period has completed plus a grace period. This prevents tokens
+    /// from being permanently locked in the contract.
+    /// # Arguments
+    /// * `data_bump` - Bump seed for data account PDA validation
+    /// * `escrow_bump` - Bump seed for escrow wallet PDA validation
+    /// 
+    /// # Withdrawal Logic
+    /// 1. Check if grace period has passed for each beneficiary
+    /// 2. Calculate unclaimed tokens for expired beneficiaries
+    /// 3. Transfer total unclaimed amount to admin wallet
+    /// 4. Mark beneficiaries as fully claimed to prevent future claims
+    ///    
+    /// # Grace Period Calculation
+    /// Withdrawal allowed after: MAX(cliff_end + grace_period, vesting_end + grace_period)
+    /// This ensures beneficiaries have sufficient time to claim after both cliff and full vesting
     pub fn withdraw(
         ctx: Context<WithdrawUnclaimed>,
         data_bump: u8,
@@ -224,24 +294,26 @@ pub mod vesting {
         let admin_wallet = &ctx.accounts.admin_wallet;
         let token_mint_key = &ctx.accounts.token_mint.key();
 
+        // Validate escrow wallet PDA
         let (expected_escrow_pda, expected_escrow_bump) = Pubkey::find_program_address(
             &[b"escrow_wallet".as_ref(), token_mint_key.as_ref()],
             ctx.program_id
         );
-        
         require!(
             ctx.accounts.escrow_wallet.key() == expected_escrow_pda,
             VestingError::InvalidEscrowWallet
         );
-        
         require!(
             escrow_bump == expected_escrow_bump,
             VestingError::InvalidEscrowBump
         );
 
-        require!(data_account.authority == ctx.accounts.admin.key(), VestingError::UnauthorizedAdmin);
-        let now = Clock::get()?.unix_timestamp;
+        require!(
+            data_account.authority == ctx.accounts.admin.key(), 
+            VestingError::UnauthorizedAdmin
+        );
 
+        let now = Clock::get()?.unix_timestamp;
         let mut total_unclaimed = 0u64;
         let mut _beneficiaries_processed = 0u32;
 
@@ -255,6 +327,7 @@ pub mod vesting {
 
             let earliest_withdraw_time = std::cmp::max(cliff_end_time + GRACE_PERIOD, total_vesting_period + GRACE_PERIOD);
 
+            // Check if grace period has passed
             if now > earliest_withdraw_time {
                 let unclaimed_tokens = beneficiary.allocated_tokens
                     .saturating_sub(beneficiary.claimed_tokens);
@@ -309,7 +382,11 @@ macro_rules! calculate_vesting_space {
     };
 }
 
-/// Accounts required for the `initialize` instruction.
+// ================================================================================================
+// ACCOUNT STRUCTURES
+// ================================================================================================
+
+/// Account validation for initialize instruction
 /// - data_account: Stores vesting state.
 /// - escrow_wallet: Holds tokens for vesting.
 /// - wallet_to_withdraw_from: Admin's wallet to fund escrow.
@@ -353,7 +430,12 @@ pub struct Initialize<'info> {
     pub token_program: Program<'info, Token>
 }
 
-
+/// Account validation for initialize instruction
+/// - data_account: storing vesting configuration (PDA)
+/// - escrow_wallet: holding vested tokens (PDA)
+/// - sender: Beneficiary claiming tokens
+/// - token_mint: Token mint for the vesting program
+/// - wallet_to_deposit_to: Beneficiary's token account (created if needed)
 #[derive(Accounts)]
 #[instruction(data_bump: u8, wallet_bump: u8)]
 pub struct Claim<'info> {
@@ -391,42 +473,10 @@ pub struct Claim<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Represents a single beneficiary's vesting configuration.
-/// - key: Beneficiary's address.
-/// - allocated_tokens: Total tokens allocated.
-/// - claimed_tokens: Tokens already claimed.
-/// - start_time: Vesting start timestamp.
-/// - cliff_months: Number of cliff months.
-/// - total_months: Total vesting duration in months.
-#[derive(Default, Copy, Clone, AnchorSerialize, AnchorDeserialize)]
-pub struct Beneficiary {
-    pub key: Pubkey,
-    pub allocated_tokens: u64,
-    pub claimed_tokens: u64,
-    pub start_time: i64, 
-    pub cliff_months: u8,
-    pub total_months: u8,
-}
-
-/// Main account storing all vesting program state.
-/// - token_amount: Total tokens for vesting.
-/// - authority: Admin address.
-/// - escrow_wallet: Escrow wallet address.
-/// - token_mint: SPL token mint.
-/// - beneficiaries: List of all beneficiaries.
-/// - decimals: Token decimals.
-#[account]
-#[derive(Default)]
-pub struct DataAccount {
-    // Space in bytes: 8 + 8 + 32 + 32 + 32 + 1 + (4 + (50 * (32 + 8 + 8 + 10)))
-    pub token_amount: u64,     // 8
-    pub authority: Pubkey,   // 32
-    pub escrow_wallet: Pubkey, // 32
-    pub token_mint: Pubkey,    // 32
-    pub beneficiaries: Vec<Beneficiary>, // (4 + (n * (32 + 8 + 8 + 8 + 1 +1)))
-    pub decimals: u8           // 1
-}
-
+/// Account validation for withdraw instruction
+/// - data_account: storing vesting configuration (PDA)
+/// - escrow_wallet: holding vested tokens (PDA)
+/// - admin_wallet: Admin's token account to receive unclaimed tokens
 #[derive(Accounts)]
 #[instruction(data_bump: u8, escrow_bump: u8)]
 pub struct WithdrawUnclaimed<'info> {
@@ -456,7 +506,51 @@ pub struct WithdrawUnclaimed<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-// Events emitted
+// ================================================================================================
+// DATA STRUCTURES
+// ================================================================================================
+
+/// Configuration for a single beneficiary in the vesting schedule
+/// - key: Beneficiary's address.
+/// - allocated_tokens: Total tokens allocated.
+/// - claimed_tokens: Tokens already claimed.
+/// - start_time: Vesting start timestamp.
+/// - cliff_months: Number of cliff months.
+/// - total_months: Total vesting duration in months.
+#[derive(Default, Copy, Clone, AnchorSerialize, AnchorDeserialize)]
+pub struct Beneficiary {
+    pub key: Pubkey,
+    pub allocated_tokens: u64, // RAW UNITS
+    pub claimed_tokens: u64,   // RAW UNITS
+    pub start_time: i64, 
+    pub cliff_months: u8,
+    pub total_months: u8,
+}
+
+/// Main account storing all vesting program state.
+/// - token_amount: Total tokens for vesting - RAW UNITS.
+/// - authority: Admin address.
+/// - escrow_wallet: Escrow wallet address.
+/// - token_mint: SPL token mint.
+/// - beneficiaries: List of all beneficiaries.
+/// - decimals: Token decimals.
+#[account]
+#[derive(Default)]
+pub struct DataAccount {
+    // Space in bytes: 8 + 8 + 32 + 32 + 32 + 1 + (4 + (50 * (32 + 8 + 8 + 10)))
+    pub token_amount: u64,     // 8 
+    pub authority: Pubkey,   // 32
+    pub escrow_wallet: Pubkey, // 32
+    pub token_mint: Pubkey,    // 32
+    pub beneficiaries: Vec<Beneficiary>, // (4 + (n * (32 + 8 + 8 + 8 + 1 +1)))
+    pub decimals: u8           // 1
+}
+
+// ================================================================================================
+// EVENTS
+// ================================================================================================
+
+/// Emitted when vesting program is successfully initialized
 #[event]
 pub struct VestingInitialized {
     pub admin: Pubkey,
@@ -465,7 +559,7 @@ pub struct VestingInitialized {
     pub beneficiaries_count: u32,
 }
 
-
+/// Emitted when a beneficiary claims vested tokens
 #[event]
 pub struct TokensClaimed {
     pub beneficiary: Pubkey,
@@ -473,6 +567,7 @@ pub struct TokensClaimed {
     pub timestamp: i64,
 }
 
+/// Emitted when admin withdraws unclaimed tokens after grace period
 #[event]
 pub struct AllUnclaimedWithdrawn {
     pub admin: Pubkey,
@@ -481,55 +576,60 @@ pub struct AllUnclaimedWithdrawn {
     pub timestamp: i64,
 }
 
-/// Error codes for the vesting program, describing all possible failure cases.
+// ================================================================================================
+// ERROR CODES
+// ================================================================================================
+
+/// Comprehensive error codes for the vesting program
+/// 
+/// These errors provide specific feedback for various failure scenarios
+/// and help with debugging and user experience.
 #[error_code]
 pub enum VestingError {
-    #[msg("Sender is not owner of Data Account")]
+    #[msg("Unauthorized: sender is not the program admin")]
     InvalidSender,
-    #[msg("Not allowed to claim new token currently")]
+    #[msg("No tokens available to claim at this time")]
     ClaimNotAllowed,
-    #[msg("Beneficiary does not exist in account")]
+    #[msg("Beneficiary address not found in vesting program")]
     BeneficiaryNotFound,
-    #[msg("Cliff period has not been reached yet")]
+    #[msg("Cliff period has not elapsed - tokens not yet available")]
     CliffNotReached,
-    #[msg("Too many beneficiaries in vesting schedule")]
+    #[msg("Too many beneficiaries - maximum 50 allowed")]
     TooManyBeneficiaries,
-    #[msg("Invalid vesting configuration: total_months not divisible by cliff_months")]
+    #[msg("Invalid vesting configuration: total months must be divisible by cliff months")]
     InvalidVestingConfig,
-    #[msg("Invalid vesting period: total_months must be at least 1")]
+    #[msg("Invalid vesting period: must be at least 1 month")]
     InvalidVestingPeriod,
-    #[msg("Cliff period is too long (max 48 months)")]
+    #[msg("Cliff period too long - maximum 48 months allowed")]
     CliffTooLong,
-    #[msg("Math overflow")]
+    #[msg("Mathematical overflow detected in calculation")]
     MathOverflow,
-    #[msg("No beneficiaries provided")]
+    #[msg("At least one beneficiary must be specified")]
     NoBeneficiaries,
-    #[msg("Invalid amount")]
+    #[msg("Token amount must be greater than zero")]
     InvalidAmount,
-    #[msg("Invalid cliff period")]
+    #[msg("Cliff period must be less than total vesting period")]
     InvalidCliffPeriod,
-    #[msg("Invalid allocation")]
+    #[msg("Beneficiary allocation must be greater than zero")]
     InvalidAllocation,
-    #[msg("Invalid start time")]
+    #[msg("Start time must be in the future")]
     InvalidStartTime,
-    #[msg("Insufficient balance to claim")]
+    #[msg("Insufficient token balance for requested operation")]
     InsufficientBalance,
-    #[msg("Invalid decimals")]
+    #[msg("Token decimals must be 9 or less")]
     InvalidDecimals,
-    #[msg("Over allocation of tokens")]
+    #[msg("Total beneficiary allocations exceed available tokens")]
     OverAllocation,
-    #[msg("Duplicate beneficiary found")]
+    #[msg("Duplicate beneficiary address detected")]
     DuplicateBeneficiary,
-    #[msg("Unauthorized: only admin can perform this action")]
+    #[msg("Unauthorized: only program admin can perform this action")]
     UnauthorizedAdmin,
-    #[msg("No unclaimed tokens available")]
+    #[msg("No unclaimed tokens available for withdrawal")]
     NoUnclaimedTokens,
-    #[msg("Start time is too far in the future")]
+    #[msg("Start time is too far in future")]
     StartTimeTooFar,
-    #[msg("Invalid escrow wallet PDA")]
+    #[msg("Invalid escrow wallet - PDA verification failed")]
     InvalidEscrowWallet,
     #[msg("Invalid escrow bump seed")]
     InvalidEscrowBump,
-    #[msg("Precision loss occurred")]
-    PrecisionLoss,
 }

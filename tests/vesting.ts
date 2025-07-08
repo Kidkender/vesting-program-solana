@@ -21,6 +21,7 @@ import {
   createUserAndATA,
   getPassedMonths,
   getTokenBalance,
+  sleep,
   toRawUnit,
 } from "./utils";
 
@@ -57,7 +58,7 @@ describe("vesting with bank run", () => {
   let teamB: Keypair, teamBATA: PublicKey;
   anchor.setProvider(provider);
 
-  let totalVestingAmount;
+  let totalVestingAmount: BN;
 
   // Vesting configurations
   const VESTING_CONFIG = {
@@ -203,6 +204,7 @@ describe("vesting with bank run", () => {
   }
 
   it("Test Initialize", async () => {
+    sleep();
     await program.methods
       .initialize(beneficiaryArray, totalVestingAmount, DECIMALS)
       .accounts({
@@ -245,7 +247,7 @@ describe("vesting with bank run", () => {
   //  First Month From Start time
   it("Team A cannot claim before cliff", async () => {
     // a month after start time
-
+    sleep();
     await warpToMonth(SECOND_PER_MONTH);
     try {
       await claimTokens(founderA.publicKey, mintAddress, founderAATA, founderA);
@@ -257,6 +259,7 @@ describe("vesting with bank run", () => {
 
   // At 6th months
   it("Founder A can claim after 5 months without buffer", async () => {
+    sleep();
     await warpToMonth(SECOND_PER_MONTH * BigInt(5));
 
     await claimTokens(founderA.publicKey, mintAddress, founderAATA, founderA);
@@ -278,6 +281,7 @@ describe("vesting with bank run", () => {
 
   // At 6th months
   it("Founder A can claim 6 months with buffer seconds", async () => {
+    sleep();
     // Add 5 seconds buffer to cross month boundary
     await warpToMonth(BigInt(BUFFER_SECONDS));
 
@@ -298,6 +302,7 @@ describe("vesting with bank run", () => {
 
   // At 10th months
   it("Admin cannot withdraw before vesting and grace period ends", async () => {
+    sleep();
     await warpToMonth(SECOND_PER_MONTH * BigInt(4));
 
     try {
@@ -320,6 +325,7 @@ describe("vesting with bank run", () => {
 
   // At 13th months
   it("Team A can claim after cliff period", async () => {
+    sleep();
     await warpToMonth(SECOND_PER_MONTH * BigInt(3));
 
     await claimTokens(teamA.publicKey, mintAddress, teamAATA, teamA);
@@ -337,6 +343,7 @@ describe("vesting with bank run", () => {
 
   // At 13th months
   it("Founder B can done claim", async () => {
+    sleep();
     await claimTokens(founderB.publicKey, mintAddress, founderBATA, founderB);
 
     const currentClock = await client.getClock();
@@ -352,6 +359,7 @@ describe("vesting with bank run", () => {
 
   // At month: 15
   it("Cannot claim more than vested amount", async () => {
+    sleep();
     await warpToMonth(SECOND_PER_MONTH * BigInt(2));
 
     try {
@@ -363,6 +371,7 @@ describe("vesting with bank run", () => {
   });
 
   it("Non-beneficiary cannot claim (BeneficiaryNotFound)", async () => {
+    sleep();
     const [stranger, strangerATA] = await createUserAndATA(
       ctx,
       provider,
@@ -377,6 +386,7 @@ describe("vesting with bank run", () => {
   });
 
   it("Non-admin cannot withdraw (UnauthorizedAdmin)", async () => {
+    sleep();
     try {
       await program.methods
         .withdraw(dataBump, escrowBump)

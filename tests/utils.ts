@@ -198,3 +198,7 @@ export function getPassedMonths(
 
   return Math.floor(passedSeconds / Number(SECOND_PER_MONTH));
 }
+
+export function sleep(ms: number = 50): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

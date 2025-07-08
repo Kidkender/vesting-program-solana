@@ -10,11 +10,11 @@ This project implements a secure, production-ready token vesting smart contract 
 
 - **Multiple Beneficiaries:** Each vesting schedule can include up to 50 beneficiaries, each with custom allocation, cliff, and vesting period.
 - **Configurable Cliff & Vesting:** Supports per-beneficiary cliff (in months), total vesting duration, and custom start time.
-- **Admin Controls:** Only the admin can initialize, update, or withdraw unclaimed tokens.
+- **Admin Controls:** Only the admin can initialize, or withdraw unclaimed tokens.
 - **SPL Token Support:** Works with any SPL token mint.
 - **Secure Escrow (PDA):** Tokens are held in a program-derived escrow wallet, only released by program logic.
 - **Claiming Logic:** Enforces cliff, vesting, and precision rules. Prevents over-claiming and double-claiming.
-- **Grace Period:** After vesting ends, a 3-month grace period is enforced before admin can withdraw unclaimed tokens.
+- **Grace Period:** After vesting ends, a 6-month grace period is enforced before admin can withdraw unclaimed tokens.
 - **Comprehensive Error Codes:** All failure cases are explicit and auditable.
 - **Anchor Best Practices:** Uses Anchor macros, constraints, events, and error handling for maximum safety.
 
@@ -137,6 +137,16 @@ await program.methods
   })
   .rpc();
 ```
+
+## Token Amount Handling
+
+⚠️ **CRITICAL**: This program handles ALL token amounts as RAW UNITS.
+
+### Examples:
+
+- Token with 9 decimals: 1 token = 1,000,000,000 raw units
+- To vest 100 tokens: pass `amount = 100_000_000_000`
+- To allocate 5.5 tokens: set `allocated_tokens = 5_500_000_000
 
 ---
 
