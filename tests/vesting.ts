@@ -59,6 +59,7 @@ describe("vesting with bank run", () => {
   anchor.setProvider(provider);
 
   let totalVestingAmount: BN;
+  let amountTeamBFirstMonths: BN;
 
   // Vesting configurations
   const VESTING_CONFIG = {
@@ -203,6 +204,43 @@ describe("vesting with bank run", () => {
       .rpc();
   }
 
+  it("Test validate input", async () => {
+    sleep();
+    const [stranger, strangerATA] = await createUserAndATA(
+      ctx,
+      provider,
+      mintAddress
+    );
+
+    const updateBeneficiaries = [...beneficiaryArray];
+    updateBeneficiaries.push({
+      key: stranger.publicKey,
+      allocatedTokens: toRawUnit(0),
+      claimedTokens: new BN(0),
+      cliffMonths: 13,
+      totalMonths: 24,
+      startTime: new BN(START_TIME),
+    });
+    try {
+      await program.methods
+        .initialize(updateBeneficiaries, totalVestingAmount, DECIMALS)
+        .accounts({
+          dataAccount,
+          escrowWallet,
+          walletToWithdrawFrom: senderATA,
+          tokenMint: mintAddress,
+          sender: sender,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        // .signers([sender])
+        .rpc();
+      assert.fail("should not be able to initialize");
+    } catch (err) {
+      assert.equal(err.error?.errorCode?.code, "InvalidAllocation");
+    }
+  });
+
   it("Test Initialize", async () => {
     sleep();
     await program.methods
@@ -244,7 +282,7 @@ describe("vesting with bank run", () => {
     // _dataAccountAfterInit = dataAccount;
   });
 
-  //  First Month From Start time
+  // At month: 1
   it("Team A cannot claim before cliff", async () => {
     // a month after start time
     sleep();
@@ -257,7 +295,7 @@ describe("vesting with bank run", () => {
     }
   });
 
-  // At 6th months
+  // At month: 16
   it("Founder A can claim after 5 months without buffer", async () => {
     sleep();
     await warpToMonth(SECOND_PER_MONTH * BigInt(5));
@@ -273,13 +311,11 @@ describe("vesting with bank run", () => {
       beneficiaryArray[0].cliffMonths
     );
 
-    console.log("passedMonths", passedMonths);
-
     await validateClaimAmount(0, founderAATA, passedMonths);
     assert.equal(passedMonths, 5);
   });
 
-  // At 6th months
+  // At month: 16
   it("Founder A can claim 6 months with buffer seconds", async () => {
     sleep();
     // Add 5 seconds buffer to cross month boundary
@@ -300,7 +336,7 @@ describe("vesting with bank run", () => {
     assert.equal(passedMonths, 6);
   });
 
-  // At 10th months
+  // At month: 10
   it("Admin cannot withdraw before vesting and grace period ends", async () => {
     sleep();
     await warpToMonth(SECOND_PER_MONTH * BigInt(4));
@@ -323,7 +359,23 @@ describe("vesting with bank run", () => {
     }
   });
 
-  // At 13th months
+  // At month: 10
+  it("Founder B can claim at 10th month", async () => {
+    sleep();
+    await claimTokens(founderB.publicKey, mintAddress, founderBATA, founderB);
+
+    const currentClock = await client.getClock();
+    const passedMonths = getPassedMonths(
+      beneficiaryArray[1].startTime.toNumber(),
+      Number(currentClock.unixTimestamp),
+      beneficiaryArray[1].cliffMonths
+    );
+
+    await validateClaimAmount(1, founderBATA, passedMonths);
+    assert.isAtLeast(passedMonths, 10);
+  });
+
+  // At month: 13
   it("Team A can claim after cliff period", async () => {
     sleep();
     await warpToMonth(SECOND_PER_MONTH * BigInt(3));
@@ -341,37 +393,10 @@ describe("vesting with bank run", () => {
     assert.isAtLeast(passedMonths, 1);
   });
 
-  // At 13th months
-  it("Founder B can done claim", async () => {
-    sleep();
-    await claimTokens(founderB.publicKey, mintAddress, founderBATA, founderB);
-
-    const currentClock = await client.getClock();
-    const passedMonths = getPassedMonths(
-      beneficiaryArray[1].startTime.toNumber(),
-      Number(currentClock.unixTimestamp),
-      beneficiaryArray[1].cliffMonths
-    );
-
-    await validateClaimAmount(1, founderBATA, passedMonths);
-    assert.isAtLeast(passedMonths, 12);
-  });
-
   // At month: 15
-  it("Cannot claim more than vested amount", async () => {
-    sleep();
-    await warpToMonth(SECOND_PER_MONTH * BigInt(2));
-
-    try {
-      await claimTokens(founderB.publicKey, mintAddress, founderBATA, founderB);
-      assert.fail("Should not be able to claim more than vested amount");
-    } catch (err) {
-      assert.equal(err.error?.errorCode?.code, "ClaimNotAllowed");
-    }
-  });
-
   it("Non-beneficiary cannot claim (BeneficiaryNotFound)", async () => {
     sleep();
+    await warpToMonth(SECOND_PER_MONTH * BigInt(2));
     const [stranger, strangerATA] = await createUserAndATA(
       ctx,
       provider,
@@ -385,6 +410,7 @@ describe("vesting with bank run", () => {
     }
   });
 
+  // At month: 15
   it("Non-admin cannot withdraw (UnauthorizedAdmin)", async () => {
     sleep();
     try {
@@ -403,6 +429,94 @@ describe("vesting with bank run", () => {
       assert.fail("Non-admin should not be able to withdraw");
     } catch (err) {
       assert.equal(err.error?.errorCode?.code, "UnauthorizedAdmin");
+    }
+  });
+
+  // At month: 18
+  it("Admin can withdraw balance of founder B after end grace period", async () => {
+    sleep();
+    await warpToMonth(SECOND_PER_MONTH * BigInt(3));
+
+    await program.methods
+      .withdraw(dataBump, escrowBump)
+      .accounts({
+        dataAccount,
+        escrowWallet,
+        adminWallet: senderATA,
+        admin: sender,
+        tokenMint: mintAddress,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+    const adminAmount = await getTokenBalance(senderATA, provider);
+    const remainAmount = TOTAL_AMOUNT_INIT.sub(totalVestingAmount); // 15000 - 10500 = 4500
+    const founderBAmount = await getTokenBalance(founderBATA, provider);
+    const unclaimed = beneficiaryArray[1].allocatedTokens.sub(founderBAmount);
+    const remainAddUnclaimed = remainAmount.add(unclaimed);
+    assert.equal(remainAddUnclaimed.toString(), adminAmount.toString());
+  });
+
+  // At month: 18
+  it("Founder B cannot claim more than vested amount", async () => {
+    sleep();
+    // await warpToMonth(SECOND_PER_MONTH * BigInt(2));
+
+    try {
+      await claimTokens(founderB.publicKey, mintAddress, founderBATA, founderB);
+      assert.fail("Should not be able to claim more than vested amount");
+    } catch (err) {
+      assert.equal(err.error?.errorCode?.code, "ClaimNotAllowed");
+    }
+  });
+
+  // At month: 25
+  it("team B can claim first at 25th months", async () => {
+    sleep();
+    warpToMonth(SECOND_PER_MONTH * BigInt(7));
+    await claimTokens(teamB.publicKey, mintAddress, teamBATA, teamB);
+
+    const currentClock = await client.getClock();
+    const passedMonths = getPassedMonths(
+      beneficiaryArray[3].startTime.toNumber(),
+      Number(currentClock.unixTimestamp),
+      beneficiaryArray[3].cliffMonths
+    );
+
+    await validateClaimAmount(3, teamBATA, passedMonths);
+    amountTeamBFirstMonths = await getTokenBalance(teamBATA, provider);
+
+    assert.isAtLeast(passedMonths, 1);
+  });
+
+  // At month: 45
+  it("team B must claim 21 months at months 45", async () => {
+    sleep();
+    warpToMonth(SECOND_PER_MONTH * BigInt(20));
+    await claimTokens(teamB.publicKey, mintAddress, teamBATA, teamB);
+
+    const currentClock = await client.getClock();
+    const passedMonths = getPassedMonths(
+      beneficiaryArray[3].startTime.toNumber(),
+      Number(currentClock.unixTimestamp),
+      beneficiaryArray[3].cliffMonths
+    );
+    const currentAmount = await getTokenBalance(teamBATA, provider);
+
+    await validateClaimAmount(3, teamBATA, passedMonths);
+    const numMonths = currentAmount.div(new BN(amountTeamBFirstMonths));
+    assert.isAtLeast(passedMonths, 21);
+    assert.equal(numMonths.toString(), "21");
+  });
+
+  // At month: 45
+  it("team B cannot continue claim at months 45", async () => {
+    sleep();
+
+    try {
+      await claimTokens(teamB.publicKey, mintAddress, teamBATA, teamB);
+      assert.fail("Should not be able to claim more than vested amount");
+    } catch (err) {
+      assert.equal(err.error?.errorCode?.code, "ClaimNotAllowed");
     }
   });
 });

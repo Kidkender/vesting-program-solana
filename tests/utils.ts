@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
-import * as spl from "@solana/spl-token";
 import { u64 } from "@solana/buffer-layout-utils";
+import * as spl from "@solana/spl-token";
 
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -8,6 +8,7 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 
+import { BN } from "@coral-xyz/anchor";
 import {
   Keypair,
   LAMPORTS_PER_SOL,
@@ -16,8 +17,7 @@ import {
   Transaction,
 } from "@solana/web3.js";
 import { BankrunProvider } from "anchor-bankrun";
-import { BanksClient, Clock, ProgramTestContext } from "solana-bankrun";
-import { BN } from "@coral-xyz/anchor";
+import { ProgramTestContext } from "solana-bankrun";
 import { SECOND_PER_MONTH } from "./constant";
 
 export const createMint = async (
