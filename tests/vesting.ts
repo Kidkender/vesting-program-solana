@@ -22,7 +22,7 @@ import {
   getPassedMonths,
   getTokenBalance,
   sleep,
-  toRawUnit,
+  toRawUnitFromBN,
 } from "./utils";
 
 interface BeneficiaryInput {
@@ -63,10 +63,10 @@ describe("vesting with bank run", () => {
 
   // Vesting configurations
   const VESTING_CONFIG = {
-    founderA: { amount: 5_000, cliff: 0, duration: 48 },
-    founderB: { amount: 5_000, cliff: 0, duration: 12 },
-    teamA: { amount: 333.333, cliff: 12, duration: 48 },
-    teamB: { amount: 166.667, cliff: 24, duration: 48 },
+    founderA: { amount: new BN(5_000_000_000), cliff: 0, duration: 48 },
+    founderB: { amount: new BN(5_000_000_000), cliff: 0, duration: 12 },
+    teamA: { amount: new BN(333_333_333), cliff: 12, duration: 48 },
+    teamB: { amount: new BN(166_666_667), cliff: 24, duration: 48 },
   };
 
   before(async () => {
@@ -133,7 +133,7 @@ describe("vesting with bank run", () => {
 
     beneficiaryArray = configs.map(({ user, config }) => ({
       key: user.publicKey,
-      allocatedTokens: toRawUnit(config.amount),
+      allocatedTokens: toRawUnitFromBN(config.amount),
       claimedTokens: new BN(0),
       startTime: new BN(START_TIME),
       cliffMonths: config.cliff,
@@ -215,7 +215,7 @@ describe("vesting with bank run", () => {
     const updateBeneficiaries = [...beneficiaryArray];
     updateBeneficiaries.push({
       key: stranger.publicKey,
-      allocatedTokens: toRawUnit(0),
+      allocatedTokens: toRawUnitFromBN(new BN(0)),
       claimedTokens: new BN(0),
       cliffMonths: 13,
       totalMonths: 24,
@@ -263,7 +263,9 @@ describe("vesting with bank run", () => {
 
     assert.deepEqual(escrowWalletBalance, totalVestingAmount);
     assert.isTrue(
-      accountAfterInit.beneficiaries[0].allocatedTokens.eq(toRawUnit(5_000)),
+      accountAfterInit.beneficiaries[0].allocatedTokens.eq(
+        toRawUnitFromBN(new BN(5_000_000_000))
+      ),
       "allocatedTokens is not equal to 5_000"
     );
     assert.equal(
@@ -274,7 +276,9 @@ describe("vesting with bank run", () => {
     assert.equal(accountAfterInit.beneficiaries[0].totalMonths, 48);
 
     assert.isTrue(
-      accountAfterInit.beneficiaries[3].allocatedTokens.eq(toRawUnit(166.667)),
+      accountAfterInit.beneficiaries[3].allocatedTokens.eq(
+        toRawUnitFromBN(new BN(166_666_667))
+      ),
       "allocatedTokens is not equal to 166.667"
     );
     assert.equal(accountAfterInit.beneficiaries[3].cliffMonths, 24);
@@ -295,8 +299,11 @@ describe("vesting with bank run", () => {
     }
   });
 
-  // At month: 16
+  // At month: 6
   it("Founder A can claim after 5 months without buffer", async () => {
+    const atMonth16 = await client.getClock();
+    const timeAtMonth16 = Number(atMonth16.unixTimestamp);
+    console.log("time at month: 6 without buffer");
     sleep();
     await warpToMonth(SECOND_PER_MONTH * BigInt(5));
 
@@ -492,7 +499,9 @@ describe("vesting with bank run", () => {
   it("team B must claim 21 months at months 45", async () => {
     sleep();
     warpToMonth(SECOND_PER_MONTH * BigInt(20));
+    await claimTokens(teamA.publicKey, mintAddress, teamAATA, teamA);
     await claimTokens(teamB.publicKey, mintAddress, teamBATA, teamB);
+    await claimTokens(founderA.publicKey, mintAddress, founderAATA, founderA);
 
     const currentClock = await client.getClock();
     const passedMonths = getPassedMonths(

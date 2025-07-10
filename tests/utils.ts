@@ -165,14 +165,18 @@ export const getTokenBalance = async (
   return new BN(amount.property);
 };
 
-export function toRawUnit(amount: number, decimals: number = 6): BN {
-  const [whole, frac = ""] = amount.toString().split(".");
-  const fracPart = frac.padEnd(decimals, "0").slice(0, decimals);
-  const raw = whole + fracPart;
+// export function toRawUnit(amount: number, decimals: number = 6): BN {
+//   const [whole, frac = ""] = amount.toString().split(".");
+//   const fracPart = frac.padEnd(decimals, "0").slice(0, decimals);
+//   const raw = whole + fracPart;
 
-  const result = new BN(raw);
-  // console.log(`toRawUnit(${amount}) = ${result.toString()}`);
-  return result;
+//   const result = new BN(raw);
+//   return result;
+// }
+
+export function toRawUnitFromBN(amount: BN, decimals: number = 6): BN {
+  const multiplier = new BN(10).pow(new BN(decimals));
+  return amount.mul(multiplier);
 }
 
 export async function createPDA(
@@ -199,6 +203,6 @@ export function getPassedMonths(
   return Math.floor(passedSeconds / Number(SECOND_PER_MONTH));
 }
 
-export function sleep(ms: number = 50): Promise<void> {
+export function sleep(ms: number = 150): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
