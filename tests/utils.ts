@@ -165,15 +165,6 @@ export const getTokenBalance = async (
   return new BN(amount.property);
 };
 
-// export function toRawUnit(amount: number, decimals: number = 6): BN {
-//   const [whole, frac = ""] = amount.toString().split(".");
-//   const fracPart = frac.padEnd(decimals, "0").slice(0, decimals);
-//   const raw = whole + fracPart;
-
-//   const result = new BN(raw);
-//   return result;
-// }
-
 export function toRawUnitFromBN(amount: BN, decimals: number = 6): BN {
   const multiplier = new BN(10).pow(new BN(decimals));
   return amount.mul(multiplier);
