@@ -36,7 +36,7 @@ pub const MAX_BENEFICIARIES: usize = 50;
 /// Maximum token decimals supported
 pub const MAX_DECIMALS: u8 = 9;
 
-declare_id!("2Ut9RKeaqo895gVTEZ6fgG9WJ2sZAPfws5Hp3WGkcAg8");
+declare_id!("94XXemxbSsTsKxdEzsfQX76BmV2Uo2JSbVeSC61a6zDp");
 
 // ================================================================================================
 // PROGRAM INSTRUCTIONS
@@ -145,7 +145,7 @@ pub mod vesting {
         Ok(())
     }
 
-/// Claims unlocked tokens for a beneficiary according to their vesting schedule.
+    /// Claims unlocked tokens for a beneficiary according to their vesting schedule.
     /// 
     /// This function calculates the amount of tokens that have vested for the calling
     /// beneficiary and transfers the claimable amount to their wallet. The calculation
@@ -253,7 +253,9 @@ pub mod vesting {
 
         require!(escrow_wallet.amount >= transfer_amount, VestingError::InsufficientBalance);
         
-        data_account.beneficiaries[index].claimed_tokens += transfer_amount ;
+        data_account.beneficiaries[index].claimed_tokens = data_account.beneficiaries[index].claimed_tokens
+            .checked_add(transfer_amount)
+            .ok_or(VestingError::MathOverflow)?;
         
         token::transfer(cpi_ctx, transfer_amount)?;
 
@@ -333,9 +335,13 @@ pub mod vesting {
                     .saturating_sub(beneficiary.claimed_tokens);
 
                 if unclaimed_tokens > 0 {
-                    total_unclaimed += unclaimed_tokens;
+                    total_unclaimed = total_unclaimed
+                        .checked_add(unclaimed_tokens)
+                        .ok_or(VestingError::MathOverflow)?;
                     data_account.beneficiaries[i].claimed_tokens = beneficiary.allocated_tokens;
-                    _beneficiaries_processed += 1;
+                    _beneficiaries_processed = _beneficiaries_processed
+                        .checked_add(1)
+                        .ok_or(VestingError::MathOverflow)?;
                 }
             }
         }
@@ -373,6 +379,23 @@ pub mod vesting {
         Ok(())
     }
 
+    pub fn change_admin(
+        ctx: Context<ChangeAdmin>,
+        _data_bump: u8,
+    )-> Result<()> {
+        let  data_account = &mut ctx.accounts.data_account;
+        require!(data_account.authority == ctx.accounts.current_admin.key(), VestingError::UnauthorizedAdmin);
+
+        data_account.authority = ctx.accounts.new_admin.key();
+
+        emit!(AdminChanged {
+            old_admin: ctx.accounts.current_admin.key(),
+            new_admin: ctx.accounts.new_admin.key(),
+            timestamp: Clock::get()?.unix_timestamp
+        });
+
+        Ok(())  
+}
 }
 
 // Macro to calculate the space required for the DataAccount based on the number of beneficiaries.
@@ -506,6 +529,35 @@ pub struct WithdrawUnclaimed<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+
+/// Account validation for change_admin instruction
+/// - data_account: Stores vesting state (PDA)
+/// - current_admin: Current admin (must sign)
+/// - new_admin: New admin address
+#[derive(Accounts)]
+#[instruction(data_bump: u8)]
+pub struct ChangeAdmin<'info> {
+    #[account(
+        mut,
+        seeds = [b"data_account", token_mint.key().as_ref()],
+        bump = data_bump,
+        constraint = data_account.authority == current_admin.key() @VestingError::UnauthorizedAdmin,
+    )]
+    pub data_account: Account<'info, DataAccount>,
+
+    #[account(mut)]
+    pub current_admin: Signer<'info>,
+    
+    #[account(
+        mut,
+        constraint = new_admin.key() != current_admin.key() @VestingError::SameAdmin,
+        constraint = new_admin.key() != Pubkey::default()   @VestingError::InvalidAddress
+    )]
+    pub new_admin: UncheckedAccount<'info>,
+
+    pub token_mint: Account<'info, Mint>
+}
+
 // ================================================================================================
 // DATA STRUCTURES
 // ================================================================================================
@@ -576,6 +628,13 @@ pub struct AllUnclaimedWithdrawn {
     pub timestamp: i64,
 }
 
+#[event]
+pub struct AdminChanged {
+    pub old_admin: Pubkey,
+    pub new_admin: Pubkey,
+    pub timestamp: i64
+}
+
 // ================================================================================================
 // ERROR CODES
 // ================================================================================================
@@ -632,4 +691,8 @@ pub enum VestingError {
     InvalidEscrowWallet,
     #[msg("Invalid escrow bump seed")]
     InvalidEscrowBump,
+    #[msg("Cannot set admin to the same address")]
+    SameAdmin,
+    #[msg("Invalid admin address")]
+    InvalidAddress,
 }
