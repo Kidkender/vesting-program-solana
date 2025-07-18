@@ -46,7 +46,7 @@ pub mod vesting {
 
     use super::*;
 
- /// Initializes a new vesting schedule for multiple beneficiaries.
+    /// Initializes a new vesting schedule for multiple beneficiaries.
     /// 
     /// This function sets up a token vesting contract with multiple beneficiaries,
     /// each having their own cliff period and vesting duration. The admin transfers
@@ -147,6 +147,8 @@ pub mod vesting {
 
     /// Claims unlocked tokens for a beneficiary according to their vesting schedule.
     /// 
+    /// Note: Vesting is calculated in discrete monthly steps, not continuously per second.
+    /// 
     /// This function calculates the amount of tokens that have vested for the calling
     /// beneficiary and transfers the claimable amount to their wallet. The calculation
     /// considers cliff periods and linear vesting over the specified duration.
@@ -201,10 +203,7 @@ pub mod vesting {
         let months_elapsed = if now >= beneficiary.start_time {
             let time_diff = now.saturating_sub(beneficiary.start_time);
             let calculated_months = time_diff.checked_div(SECONDS_PER_MONTH).ok_or(VestingError::MathOverflow)?;
-            
-            // Safety cap: use actual beneficiary's total_months + small buffer
-            let safety_cap = (beneficiary.total_months as i64).saturating_add(120); 
-            std::cmp::min(calculated_months, safety_cap) as u64
+            calculated_months as u64
         } else {
             0u64
         };
@@ -379,6 +378,11 @@ pub mod vesting {
         Ok(())
     }
 
+    /// Changes the admin of the vesting program.
+    /// 
+    /// This function allows the current admin to transfer ownership of the vesting program
+    /// to a new admin. The new admin must be a valid Solana address and must not be the same
+    /// as the current admin.
     pub fn change_admin(
         ctx: Context<ChangeAdmin>,
         _data_bump: u8,
@@ -628,6 +632,7 @@ pub struct AllUnclaimedWithdrawn {
     pub timestamp: i64,
 }
 
+/// Emitted when admin changes
 #[event]
 pub struct AdminChanged {
     pub old_admin: Pubkey,
